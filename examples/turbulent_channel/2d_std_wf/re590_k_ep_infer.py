@@ -1,0 +1,348 @@
+import time
+import os
+# Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import paddle
+import numpy as np
+from sympy import Symbol, Eq, sin, cos, Min, Max, Abs, log, exp, Symbol, Function
+
+import modulus.sym
+from modulus.sym.hydra import to_absolute_path, instantiate_arch, ModulusConfig
+from modulus.sym.solver import Solver
+from modulus.sym.domain import Domain
+from modulus.sym.geometry.primitives_2d import Rectangle, Line, Channel2D
+from modulus.sym.utils.sympy.functions import parabola
+from modulus.sym.utils.io import csv_to_dict
+from modulus.sym.eq.pdes.navier_stokes import NavierStokes
+from modulus.sym.domain.constraint import (
+    PointwiseBoundaryConstraint,
+    PointwiseInteriorConstraint,
+    IntegralBoundaryConstraint,
+)
+from modulus.sym.domain.monitor import PointwiseMonitor
+from modulus.sym.domain.inferencer import PointwiseInferencer
+from modulus.sym.key import Key
+from modulus.sym.node import Node
+
+from custom_k_ep import kEpsilonInit, kEpsilon, kEpsilonStdWF
+
+
+@modulus.sym.main(config_path="conf_re590_k_ep", config_name="config")
+def run(cfg: ModulusConfig) -> None:
+    # simulation parameters
+    Re = 590
+    nu = 1 / Re
+    y_plus = 30
+    karman_constant = 0.4187
+    resolved_y_start = y_plus * nu
+    channel_width = (-1, 1)
+    channel_length = (-np.pi / 2, np.pi / 2)
+
+    inlet = Line(
+        (channel_length[0], channel_width[0]),
+        (channel_length[0], channel_width[1]),
+        normal=1,
+    )
+    outlet = Line(
+        (channel_length[1], channel_width[0]),
+        (channel_length[1], channel_width[1]),
+        normal=1,
+    )
+
+    geo_sdf = Channel2D(
+        (channel_length[0], channel_width[0]), (channel_length[1], channel_width[1])
+    )
+
+    # geometry where the equations are solved
+    geo_resolved = Channel2D(
+        (channel_length[0], channel_width[0] + resolved_y_start),
+        (channel_length[1], channel_width[1] - resolved_y_start),
+    )
+
+    # make list of nodes to unroll graph on
+    init = kEpsilonInit(nu=nu, rho=1.0)
+    eq = kEpsilon(nu=nu, rho=1.0)
+    wf = kEpsilonStdWF(nu=nu, rho=1.0)
+
+    u_tau_net = instantiate_arch(
+        input_keys=[Key("u_in"), Key("y_in")],
+        output_keys=[Key("u_tau_out")],
+        cfg=cfg.arch.fully_connected,
+    )
+    flow_net = instantiate_arch(
+        input_keys=[Key("x_sin"), Key("y")],
+        output_keys=[Key("u"), Key("v")],
+        frequencies=("axis", [i / 2 for i in range(8)]),
+        frequencies_params=("axis", [i / 2 for i in range(8)]),
+        cfg=cfg.arch.fourier,
+    )
+    p_net = instantiate_arch(
+        input_keys=[Key("x"), Key("y")],
+        output_keys=[Key("p")],
+        frequencies=("axis", [i / 2 for i in range(8)]),
+        frequencies_params=("axis", [i / 2 for i in range(8)]),
+        cfg=cfg.arch.fourier,
+    )
+    k_net = instantiate_arch(
+        input_keys=[Key("x_sin"), Key("y")],
+        output_keys=[Key("k_star")],
+        frequencies=("axis", [i / 2 for i in range(8)]),
+        frequencies_params=("axis", [i / 2 for i in range(8)]),
+        cfg=cfg.arch.fourier,
+    )
+    ep_net = instantiate_arch(
+        input_keys=[Key("x_sin"), Key("y")],
+        output_keys=[Key("ep_star")],
+        frequencies=("axis", [i / 2 for i in range(8)]),
+        frequencies_params=("axis", [i / 2 for i in range(8)]),
+        cfg=cfg.arch.fourier,
+    )
+
+    def Softplus(*symbols: Symbol):
+        return Function("softplus")(*symbols)
+
+    nodes = (
+        init.make_nodes()
+        + eq.make_nodes()
+        + wf.make_nodes()
+        + [
+            Node.from_sympy(
+                sin(2 * np.pi * Symbol("x") / (channel_length[1] - channel_length[0])),
+                "x_sin",
+            )
+        ]
+        + [Node.from_sympy(Min(Softplus(Symbol("k_star")) + 1e-4, 20), "k")]
+        + [Node.from_sympy(Min(Softplus(Symbol("ep_star")) + 1e-4, 180), "ep")]
+        + [flow_net.make_node(name="flow_network")]
+        + [p_net.make_node(name="p_network")]
+        + [k_net.make_node(name="k_network")]
+        + [ep_net.make_node(name="ep_network")]
+    )
+
+    nodes_u_tau = (
+        [Node.from_sympy(Symbol("normal_distance"), "y_in")]
+        + [
+            Node.from_sympy(
+                (
+                    (
+                        Symbol("u")
+                        - (
+                            Symbol("u") * (-Symbol("normal_x"))
+                            + Symbol("v") * (-Symbol("normal_y"))
+                        )
+                        * (-Symbol("normal_x"))
+                    )
+                    ** 2
+                    + (
+                        Symbol("v")
+                        - (
+                            Symbol("u") * (-Symbol("normal_x"))
+                            + Symbol("v") * (-Symbol("normal_y"))
+                        )
+                        * (-Symbol("normal_y"))
+                    )
+                    ** 2
+                )
+                ** 0.5,
+                "u_parallel_to_wall",
+            )
+        ]
+        + [Node.from_sympy(Symbol("u_parallel_to_wall"), "u_in")]
+        + [Node.from_sympy(Symbol("u_tau_out"), "u_tau")]
+        + [u_tau_net.make_node(name="u_tau_network", optimize=False)]
+    )
+
+    # add constraints to solver
+    p_grad = 1.0
+
+    x, y = Symbol("x"), Symbol("y")
+
+    # make domain
+    domain = Domain()
+
+    # Point where wall funciton is applied
+    wf_pt = PointwiseBoundaryConstraint(
+        nodes=nodes + nodes_u_tau,
+        geometry=geo_resolved,
+        outvar={
+            "velocity_wall_normal_wf": 0,
+            "velocity_wall_parallel_wf": 0,
+            "ep_wf": 0,
+            "k_wf": 0,
+            "wall_shear_stress_x_wf": 0,
+            "wall_shear_stress_y_wf": 0,
+        },
+        lambda_weighting={
+            "velocity_wall_normal_wf": 100,
+            "velocity_wall_parallel_wf": 100,
+            "ep_wf": 1,
+            "k_wf": 1,
+            "wall_shear_stress_x_wf": 100,
+            "wall_shear_stress_y_wf": 100,
+        },
+        batch_size=cfg.batch_size.wf_pt,
+        parameterization={"normal_distance": resolved_y_start},
+        loss=modulus.sym.loss.PointwiseLossNorm(name="WF"),
+    )
+    domain.add_constraint(wf_pt, "WF")
+
+    # interior
+    interior = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=geo_resolved,
+        outvar={
+            "continuity": 0,
+            "momentum_x": 0,
+            "momentum_y": 0,
+            "k_equation": 0,
+            "ep_equation": 0,
+        },
+        lambda_weighting={
+            "continuity": 100,
+            "momentum_x": 1000,
+            "momentum_y": 1000,
+            "k_equation": 10,
+            "ep_equation": 1,
+        },
+        batch_size=cfg.batch_size.interior,
+        bounds={x: channel_length, y: channel_width},
+        loss=modulus.sym.loss.PointwiseLossNorm(name="Interior"),
+    )
+    domain.add_constraint(interior, "Interior")
+
+    # pressure pc
+    inlet = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=inlet,
+        outvar={"p": p_grad * (channel_length[1] - channel_length[0])},
+        lambda_weighting={"p": 10},
+        batch_size=cfg.batch_size.inlet,
+        loss=modulus.sym.loss.PointwiseLossNorm(name="Inlet"),
+    )
+    domain.add_constraint(inlet, "Inlet")
+
+    # pressure pc
+    outlet = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=outlet,
+        outvar={"p": 0},
+        lambda_weighting={"p": 10},
+        batch_size=cfg.batch_size.outlet,
+        loss=modulus.sym.loss.PointwiseLossNorm(name="Outlet"),
+    )
+    domain.add_constraint(outlet, "Outlet")
+
+    # flow initialization
+    interior = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=geo_resolved,
+        outvar={"u_init": 0, "v_init": 0, "k_init": 0, "p_init": 0, "ep_init": 0},
+        batch_size=cfg.batch_size.interior_init,
+        bounds={x: channel_length, y: channel_width},
+        loss=modulus.sym.loss.PointwiseLossNorm(name="InteriorInit"),
+    )
+    domain.add_constraint(interior, "InteriorInit")
+
+    # add inferencing and monitor
+    invar_wf_pt = geo_resolved.sample_boundary(
+        1024, parameterization={"normal_distance": resolved_y_start}
+    )
+    u_tau_monitor = PointwiseMonitor(
+        invar_wf_pt,
+        output_names=["u_tau"],
+        metrics={"mean_u_tau": lambda var: paddle.mean(var["u_tau"])},
+        nodes=nodes + nodes_u_tau,
+    )
+    domain.add_monitor(u_tau_monitor)
+
+    # add inferencer data
+    inference = PointwiseInferencer(
+        nodes=nodes,
+        invar=geo_resolved.sample_interior(
+            5000, bounds={x: channel_length, y: channel_width}
+        ),
+        output_names=["u", "v", "p", "k", "ep"],
+    )
+    domain.add_inferencer(inference, "inf_interior")
+
+    inference = PointwiseInferencer(
+        nodes=nodes + nodes_u_tau,
+        invar=geo_resolved.sample_boundary(
+            10, parameterization={"normal_distance": resolved_y_start}
+        ),
+        output_names=["u", "v", "p", "k", "ep", "normal_distance", "u_tau"],
+    )
+    domain.add_inferencer(inference, "inf_wf")
+
+    # create solver and initialize models
+    slv = Solver(cfg, domain)
+    slv.saveable_models = slv.get_saveable_models()
+    slv.global_optimizer_model = slv.create_global_optimizer_model()
+    from modulus.sym.trainer import Trainer
+    Trainer._load_model(
+        slv.initialization_network_dir,
+        slv.network_dir,
+        slv.saveable_models,
+        0,
+        slv.log,
+        slv.place,
+    )
+
+    warmup_iters = int(os.getenv("INFER_WARMUP", "10"))
+    bench_iters = int(os.getenv("INFER_STEPS", "100"))
+
+    for model in slv.saveable_models:
+        model.eval()
+
+    print(f"[Inference] warmup_iters={warmup_iters}, bench_iters={bench_iters}")
+
+    for i in range(warmup_iters):
+        slv.load_data()
+        _ = slv.compute_losses(i)
+
+    paddle.device.cuda.synchronize()
+    start = time.perf_counter()
+    for i in range(bench_iters):
+        slv.load_data()
+        _ = slv.compute_losses(i)
+    paddle.device.cuda.synchronize()
+    end = time.perf_counter()
+
+    avg_latency = (end - start) / bench_iters * 1000
+    print(f"time/iteration: {avg_latency:.4f}")
+    print(f"[Inference] avg_latency: {avg_latency:.4f} ms")
+    print(f"[Inference] throughput: {bench_iters / (end - start):.2f} iterations/s")
+    print(f"[Inference] gpu_memory_peak: {paddle.device.cuda.max_memory_allocated() / (1<<20):.1f} MB")
+
+    if os.getenv("INFER_CHECK_ACCURACY", "0") == "1":
+        accuracy_iters = int(os.getenv("INFER_ACCURACY_ITERS", "50"))
+        all_losses = []
+        for i in range(accuracy_iters):
+            slv.load_data()
+            losses = slv.compute_losses(i)
+            all_losses.append({k: v.item() for k, v in losses.items()})
+        loss_keys = all_losses[0].keys()
+        print(f"\n[Accuracy] Per-constraint average loss ({accuracy_iters} iters):")
+        total_loss = 0.0
+        for key in sorted(loss_keys):
+            vals = [loss[key] for loss in all_losses]
+            avg_val = np.mean(vals)
+            total_loss += avg_val
+            print(f"  loss: {key}: {avg_val:.10f}")
+        print(f"  loss: total: {total_loss:.10f}")
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,232 @@
+import time
+# Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import warnings
+
+from sympy import Symbol, Eq, Abs
+import paddle
+import modulus.sym
+from modulus.sym.hydra import to_absolute_path, instantiate_arch, ModulusConfig
+from modulus.sym.utils.io import csv_to_dict
+from modulus.sym.solver import Solver
+from modulus.sym.domain import Domain
+from modulus.sym.geometry.primitives_2d import Rectangle
+
+from modulus.sym.domain.constraint import (
+    PointwiseBoundaryConstraint,
+    PointwiseInteriorConstraint,
+)
+from modulus.sym.domain.monitor import PointwiseMonitor
+from modulus.sym.domain.validator import PointwiseValidator
+from modulus.sym.domain.inferencer import PointwiseInferencer
+from modulus.sym.eq.pdes.navier_stokes import NavierStokes
+from modulus.sym.eq.pdes.turbulence_zero_eq import ZeroEquation
+from modulus.sym.utils.io.plotter import ValidatorPlotter, InferencerPlotter
+from modulus.sym.key import Key
+import numpy as np
+
+
+@modulus.sym.main(config_path="conf_zeroEq", config_name="config")
+def run(cfg: ModulusConfig) -> None:
+    # add constraints to solver
+    # make geometry
+    height = 0.1
+    width = 0.1
+    x, y = Symbol("x"), Symbol("y")
+    rec = Rectangle((-width / 2, -height / 2), (width / 2, height / 2))
+
+    # make list of nodes to unroll graph on
+    ze = ZeroEquation(nu=1e-4, dim=2, time=False, max_distance=height / 2)
+    ns = NavierStokes(nu=ze.equations["nu"], rho=1.0, dim=2, time=False)
+    flow_net = instantiate_arch(
+        input_keys=[Key("x"), Key("y")],
+        output_keys=[Key("u"), Key("v"), Key("p")],
+        cfg=cfg.arch.fully_connected,
+    )
+
+    nodes = (
+        ns.make_nodes() + ze.make_nodes() + [flow_net.make_node(name="flow_network")]
+    )
+
+    # make ldc domain
+    ldc_domain = Domain()
+
+    # top wall
+    top_wall = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={"u": 1.5, "v": 0},
+        batch_size=cfg.batch_size.TopWall,
+        lambda_weighting={"u": 1.0 - 20 * Abs(x), "v": 1.0},  # weight edges to be zero
+        criteria=Eq(y, height / 2),
+        loss=modulus.sym.loss.PointwiseLossNorm(name="top_wall"),
+    )
+    ldc_domain.add_constraint(top_wall, "top_wall")
+
+    # no slip
+    no_slip = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={"u": 0, "v": 0},
+        batch_size=cfg.batch_size.NoSlip,
+        criteria=y < height / 2,
+        loss=modulus.sym.loss.PointwiseLossNorm(name="no_slip"),
+    )
+    ldc_domain.add_constraint(no_slip, "no_slip")
+
+    # interior
+    interior = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=rec,
+        outvar={"continuity": 0, "momentum_x": 0, "momentum_y": 0},
+        batch_size=cfg.batch_size.Interior,
+        compute_sdf_derivatives=True,
+        lambda_weighting={
+            "continuity": Symbol("sdf"),
+            "momentum_x": Symbol("sdf"),
+            "momentum_y": Symbol("sdf"),
+        },
+        loss=modulus.sym.loss.PointwiseLossNorm(name="interior"),
+    )
+    ldc_domain.add_constraint(interior, "interior")
+
+    # add validator
+    file_path = "openfoam/cavity_uniformVel_zeroEqn_refined.csv"
+    if os.path.exists(to_absolute_path(file_path)):
+        mapping = {
+            "Points:0": "x",
+            "Points:1": "y",
+            "U:0": "u",
+            "U:1": "v",
+            "p": "p",
+            "d": "sdf",
+            "nuT": "nu",
+        }
+        openfoam_var = csv_to_dict(to_absolute_path(file_path), mapping)
+        openfoam_var["x"] += -width / 2  # center OpenFoam data
+        openfoam_var["y"] += -height / 2  # center OpenFoam data
+        openfoam_var["nu"] += 1e-4  # effective viscosity
+        openfoam_invar_numpy = {
+            key: value
+            for key, value in openfoam_var.items()
+            if key in ["x", "y", "sdf"]
+        }
+        openfoam_outvar_numpy = {
+            key: value for key, value in openfoam_var.items() if key in ["u", "v", "nu"]
+        }
+        openfoam_validator = PointwiseValidator(
+            nodes=nodes,
+            invar=openfoam_invar_numpy,
+            true_outvar=openfoam_outvar_numpy,
+            batch_size=1024,
+            plotter=ValidatorPlotter(),
+            requires_grad=True,
+        )
+        ldc_domain.add_validator(openfoam_validator)
+
+        # add inferencer data
+        grid_inference = PointwiseInferencer(
+            nodes=nodes,
+            invar=openfoam_invar_numpy,
+            output_names=["u", "v", "p", "nu"],
+            batch_size=1024,
+            plotter=InferencerPlotter(),
+            requires_grad=True,
+        )
+        ldc_domain.add_inferencer(grid_inference, "inf_data")
+    else:
+        warnings.warn(
+            f"Directory {file_path} does not exist. Will skip adding validators. Please download the additional files from NGC https://catalog.ngc.nvidia.com/orgs/nvidia/teams/modulus/resources/modulus_sym_examples_supplemental_materials"
+        )
+
+    # add monitors
+    global_monitor = PointwiseMonitor(
+        rec.sample_interior(4000),
+        output_names=["continuity", "momentum_x", "momentum_y"],
+        metrics={
+            "mass_imbalance": lambda var: paddle.sum(
+                var["area"] * paddle.abs(var["continuity"])
+            ),
+            "momentum_imbalance": lambda var: paddle.sum(
+                var["area"]
+                * (paddle.abs(var["momentum_x"]) + paddle.abs(var["momentum_y"]))
+            ),
+        },
+        nodes=nodes,
+        requires_grad=True,
+    )
+    # ldc_domain.add_monitor(global_monitor)
+
+    # create solver and initialize models
+    slv = Solver(cfg, ldc_domain)
+    slv.saveable_models = slv.get_saveable_models()
+    slv.global_optimizer_model = slv.create_global_optimizer_model()
+    from modulus.sym.trainer import Trainer
+    Trainer._load_model(
+        slv.initialization_network_dir,
+        slv.network_dir,
+        slv.saveable_models,
+        0,
+        slv.log,
+        slv.place,
+    )
+
+    warmup_iters = int(os.getenv("INFER_WARMUP", "10"))
+    bench_iters = int(os.getenv("INFER_STEPS", "100"))
+
+    for model in slv.saveable_models:
+        model.eval()
+
+    print(f"[Inference] warmup_iters={warmup_iters}, bench_iters={bench_iters}")
+
+    for i in range(warmup_iters):
+        slv.load_data()
+        _ = slv.compute_losses(i)
+
+    paddle.device.cuda.synchronize()
+    start = time.perf_counter()
+    for i in range(bench_iters):
+        slv.load_data()
+        _ = slv.compute_losses(i)
+    paddle.device.cuda.synchronize()
+    end = time.perf_counter()
+
+    avg_latency = (end - start) / bench_iters * 1000
+    print(f"time/iteration: {avg_latency:.4f}")
+    print(f"[Inference] avg_latency: {avg_latency:.4f} ms")
+    print(f"[Inference] throughput: {bench_iters / (end - start):.2f} iterations/s")
+    print(f"[Inference] gpu_memory_peak: {paddle.device.cuda.max_memory_allocated() / (1<<20):.1f} MB")
+
+    if os.getenv("INFER_CHECK_ACCURACY", "0") == "1":
+        accuracy_iters = int(os.getenv("INFER_ACCURACY_ITERS", "50"))
+        all_losses = []
+        for i in range(accuracy_iters):
+            slv.load_data()
+            losses = slv.compute_losses(i)
+            all_losses.append({k: v.item() for k, v in losses.items()})
+        loss_keys = all_losses[0].keys()
+        print(f"\n[Accuracy] Per-constraint average loss ({accuracy_iters} iters):")
+        total_loss = 0.0
+        for key in sorted(loss_keys):
+            vals = [loss[key] for loss in all_losses]
+            avg_val = np.mean(vals)
+            total_loss += avg_val
+            print(f"  loss: {key}: {avg_val:.10f}")
+        print(f"  loss: total: {total_loss:.10f}")
+
+
+if __name__ == "__main__":
+    run()
